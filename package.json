@@ -1,0 +1,23 @@
+{
+  "name": "clause-review-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "条文变更审阅台：规范版本差异比对与审阅批注平台",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc && node dist/server.js",
+    "test": "tsc && node --test dist/test/"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.6.3"
+  }
+}
