@@ -1,5 +1,5 @@
 import type { DB } from './db';
-import { splitParagraphs, buildFragments } from './diff';
+import { splitParagraphs, buildFragments, similarity } from './diff';
 import { migrateAnnotations, type MigrationResult } from './migrate';
 
 export function createProject(db: DB, name: string): number {
@@ -404,6 +404,310 @@ export function deleteAnnotation(
   return { status: 'ok' };
 }
 
+/* ================= 迁移复核 ================= */
+
+export interface MigrationCandidateView {
+  fragment_id: number;
+  fragment_ord: number;
+  fragment_type: 'added' | 'removed' | 'changed';
+  /** 锚点命中的是片段的旧文本侧还是新文本侧 */
+  side: 'old' | 'new';
+  similarity: number;
+  rank: number;
+  /** 迁移时是否被自动选中挂载 */
+  auto_chosen: boolean;
+  old_text: string | null;
+  new_text: string | null;
+}
+
+export interface RemountLogView {
+  id: number;
+  from_fragment_id: number | null;
+  from_fragment_ord: number | null;
+  to_fragment_id: number;
+  to_fragment_ord: number | null;
+  operator: string;
+  similarity: number | null;
+  created_at: string;
+}
+
+export interface MigrationReportItem {
+  annotation_id: number;
+  author: string;
+  content: string;
+  status: 'open' | 'resolved' | 'pending_review';
+  anchor_text: string | null;
+  /** 迁移时（或人工重挂后）记录的最佳相似度 */
+  similarity: number | null;
+  /** 来源批注 id（上一轮比对） */
+  migrated_from: number;
+  /** 当前挂载的片段（null = 待复核未挂载） */
+  fragment_id: number | null;
+  fragment_ord: number | null;
+  remounted_by: string | null;
+  remounted_at: string | null;
+  created_at: string;
+  candidates: MigrationCandidateView[];
+  remounts: RemountLogView[];
+}
+
+export interface MigrationReport {
+  comparison_id: number;
+  sealed: boolean;
+  summary: {
+    /** 本轮从上一轮迁移过来的批注总数 */
+    total: number;
+    /** 迁移时自动锚定到片段的数量 */
+    auto_migrated: number;
+    /** 当前仍处于待复核的数量 */
+    pending_review: number;
+    /** 经过人工重新挂载的数量 */
+    remounted: number;
+  };
+  items: MigrationReportItem[];
+}
+
+function getCandidatesForAnnotations(
+  db: DB,
+  annotationIds: number[]
+): Map<number, MigrationCandidateView[]> {
+  const map = new Map<number, MigrationCandidateView[]>();
+  if (annotationIds.length === 0) return map;
+  const rows = db
+    .prepare(
+      `SELECT mc.annotation_id, mc.fragment_id, mc.side, mc.similarity, mc.rank, mc.auto_chosen,
+              f.ord AS fragment_ord, f.type AS fragment_type, f.old_text, f.new_text
+         FROM migration_candidates mc
+         JOIN fragments f ON f.id = mc.fragment_id
+        WHERE mc.annotation_id IN (${annotationIds.map(() => '?').join(',')})
+        ORDER BY mc.annotation_id, mc.rank`
+    )
+    .all(...annotationIds) as Array<{
+    annotation_id: number;
+    fragment_id: number;
+    side: 'old' | 'new';
+    similarity: number;
+    rank: number;
+    auto_chosen: number;
+    fragment_ord: number;
+    fragment_type: 'added' | 'removed' | 'changed';
+    old_text: string | null;
+    new_text: string | null;
+  }>;
+  for (const r of rows) {
+    const list = map.get(r.annotation_id) ?? [];
+    list.push({
+      fragment_id: r.fragment_id,
+      fragment_ord: r.fragment_ord,
+      fragment_type: r.fragment_type,
+      side: r.side,
+      similarity: r.similarity,
+      rank: r.rank,
+      auto_chosen: r.auto_chosen === 1,
+      old_text: r.old_text,
+      new_text: r.new_text,
+    });
+    map.set(r.annotation_id, list);
+  }
+  return map;
+}
+
+function getRemountLogsForAnnotations(
+  db: DB,
+  annotationIds: number[]
+): Map<number, RemountLogView[]> {
+  const map = new Map<number, RemountLogView[]>();
+  if (annotationIds.length === 0) return map;
+  const rows = db
+    .prepare(
+      `SELECT rl.id, rl.annotation_id, rl.from_fragment_id, rl.to_fragment_id,
+              rl.operator, rl.similarity, rl.created_at,
+              fo.ord AS from_fragment_ord, ft.ord AS to_fragment_ord
+         FROM remount_logs rl
+         LEFT JOIN fragments fo ON fo.id = rl.from_fragment_id
+         LEFT JOIN fragments ft ON ft.id = rl.to_fragment_id
+        WHERE rl.annotation_id IN (${annotationIds.map(() => '?').join(',')})
+        ORDER BY rl.annotation_id, rl.id`
+    )
+    .all(...annotationIds) as Array<RemountLogView & { annotation_id: number }>;
+  for (const r of rows) {
+    const list = map.get(r.annotation_id) ?? [];
+    list.push({
+      id: r.id,
+      from_fragment_id: r.from_fragment_id,
+      from_fragment_ord: r.from_fragment_ord,
+      to_fragment_id: r.to_fragment_id,
+      to_fragment_ord: r.to_fragment_ord,
+      operator: r.operator,
+      similarity: r.similarity,
+      created_at: r.created_at,
+    });
+    map.set(r.annotation_id, list);
+  }
+  return map;
+}
+
+/**
+ * 按比对查看迁移复核报告：本轮比对中所有从上一轮迁移来的批注，
+ * 各自携带迁移时记录的候选片段及相似度、自动选中标记与人工重挂审计记录。
+ */
+export function getMigrationReport(db: DB, comparisonId: number): MigrationReport | null {
+  const cmpRow = db
+    .prepare('SELECT sealed_at FROM comparisons WHERE id = ?')
+    .get(comparisonId) as { sealed_at: string | null } | undefined;
+  if (!cmpRow) return null;
+
+  const rows = db
+    .prepare(
+      `SELECT a.id AS annotation_id, a.author, a.content, a.status, a.anchor_text, a.similarity,
+              a.migrated_from, a.fragment_id, a.remounted_by, a.remounted_at, a.created_at,
+              f.ord AS fragment_ord
+         FROM annotations a
+         LEFT JOIN fragments f ON f.id = a.fragment_id
+        WHERE a.comparison_id = ? AND a.migrated_from IS NOT NULL
+        ORDER BY a.id`
+    )
+    .all(comparisonId) as Array<Omit<MigrationReportItem, 'candidates' | 'remounts'>>;
+
+  const ids = rows.map((r) => r.annotation_id);
+  const candidatesMap = getCandidatesForAnnotations(db, ids);
+  const remountsMap = getRemountLogsForAnnotations(db, ids);
+
+  const items: MigrationReportItem[] = rows.map((r) => ({
+    ...r,
+    candidates: candidatesMap.get(r.annotation_id) ?? [],
+    remounts: remountsMap.get(r.annotation_id) ?? [],
+  }));
+
+  return {
+    comparison_id: comparisonId,
+    sealed: cmpRow.sealed_at != null,
+    summary: {
+      total: items.length,
+      auto_migrated: items.filter((it) => it.candidates.some((c) => c.auto_chosen)).length,
+      pending_review: items.filter((it) => it.status === 'pending_review').length,
+      remounted: items.filter((it) => it.remounted_by != null).length,
+    },
+    items,
+  };
+}
+
+export interface AnnotationCandidatesView {
+  annotation: {
+    id: number;
+    comparison_id: number;
+    status: AnnotationRow['status'];
+    fragment_id: number | null;
+    anchor_text: string | null;
+    author: string;
+    content: string;
+    remounted_by: string | null;
+    remounted_at: string | null;
+  };
+  /** 所属比对是否已封存（已封存禁止重挂） */
+  sealed: boolean;
+  candidates: MigrationCandidateView[];
+}
+
+/** 查询单条批注的迁移候选片段（供详情页「重新挂载」面板选择） */
+export function getAnnotationCandidates(
+  db: DB,
+  annotationId: number
+): AnnotationCandidatesView | null {
+  const ann = db
+    .prepare(
+      `SELECT a.id, a.comparison_id, a.status, a.fragment_id, a.anchor_text,
+              a.author, a.content, a.remounted_by, a.remounted_at, c.sealed_at
+         FROM annotations a
+         JOIN comparisons c ON c.id = a.comparison_id
+        WHERE a.id = ?`
+    )
+    .get(annotationId) as
+    | (AnnotationCandidatesView['annotation'] & { sealed_at: string | null })
+    | undefined;
+  if (!ann) return null;
+  const candidates = getCandidatesForAnnotations(db, [annotationId]).get(annotationId) ?? [];
+  const { sealed_at, ...annotation } = ann;
+  return { annotation, sealed: sealed_at != null, candidates };
+}
+
+export type RemountResult =
+  | { status: 'ok'; annotation: AnnotationRow }
+  | { status: 'not_found' }
+  | { status: 'sealed' }
+  | { status: 'not_pending' }
+  | { status: 'fragment_mismatch' };
+
+/**
+ * 把「待复核」批注人工重新挂载到指定候选片段：
+ *  - 仅允许 pending_review 状态的批注；已封存比对一律拒绝；
+ *  - 目标片段必须属于同一比对；
+ *  - 在单个事务内完成：批注改挂并恢复为「待处理」、记录操作者与时间、写入重挂审计日志。
+ */
+export function remountAnnotation(
+  db: DB,
+  annotationId: number,
+  fragmentId: number,
+  operator: string
+): RemountResult {
+  const tx = db.transaction((): RemountResult => {
+    const ann = db
+      .prepare(
+        `SELECT a.id, a.comparison_id, a.fragment_id, a.status, a.anchor_text, c.sealed_at
+           FROM annotations a
+           JOIN comparisons c ON c.id = a.comparison_id
+          WHERE a.id = ?`
+      )
+      .get(annotationId) as
+      | {
+          id: number;
+          comparison_id: number;
+          fragment_id: number | null;
+          status: string;
+          anchor_text: string | null;
+          sealed_at: string | null;
+        }
+      | undefined;
+    if (!ann) return { status: 'not_found' };
+    if (ann.sealed_at != null) return { status: 'sealed' };
+    if (ann.status !== 'pending_review') return { status: 'not_pending' };
+
+    const frag = db
+      .prepare('SELECT id, old_text, new_text FROM fragments WHERE id = ? AND comparison_id = ?')
+      .get(fragmentId, ann.comparison_id) as
+      | { id: number; old_text: string | null; new_text: string | null }
+      | undefined;
+    if (!frag) return { status: 'fragment_mismatch' };
+
+    const anchor = ann.anchor_text ?? '';
+    const sim = Math.max(
+      frag.old_text ? similarity(anchor, frag.old_text) : 0,
+      frag.new_text ? similarity(anchor, frag.new_text) : 0
+    );
+    const simValue = sim > 0 ? sim : null;
+
+    db.prepare(
+      `UPDATE annotations
+          SET fragment_id = ?, status = 'open', similarity = ?,
+              remounted_by = ?, remounted_at = datetime('now', 'localtime'),
+              updated_at = datetime('now', 'localtime')
+        WHERE id = ?`
+    ).run(fragmentId, simValue, operator, annotationId);
+
+    db.prepare(
+      `INSERT INTO remount_logs
+         (annotation_id, comparison_id, from_fragment_id, to_fragment_id, operator, similarity)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(annotationId, ann.comparison_id, ann.fragment_id, fragmentId, operator, simValue);
+
+    const annotation = db
+      .prepare('SELECT * FROM annotations WHERE id = ?')
+      .get(annotationId) as AnnotationRow;
+    return { status: 'ok', annotation };
+  });
+  return tx();
+}
+
 export interface AnnotationRow {
   id: number;
   comparison_id: number;
@@ -414,6 +718,9 @@ export interface AnnotationRow {
   anchor_text: string | null;
   similarity: number | null;
   migrated_from: number | null;
+  /** 最近一次人工重新挂载的操作者与时间（未重挂过为 null） */
+  remounted_by: string | null;
+  remounted_at: string | null;
   created_at: string;
   updated_at: string;
 }

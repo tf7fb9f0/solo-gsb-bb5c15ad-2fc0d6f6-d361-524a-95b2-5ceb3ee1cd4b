@@ -391,6 +391,95 @@ textarea { width: 100%; resize: vertical; font-family: inherit; }
   word-break: break-word;
 }
 
+/* 迁移复核 */
+.migration-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.migration-panel {
+  border: 1px solid #c4b5fd;
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 18px;
+  background: #faf9ff;
+}
+.mig-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 10px 0;
+  background: #fff;
+}
+.mig-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.mig-content { font-size: 14px; margin: 6px 0; }
+.cand-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin: 8px 0 4px;
+}
+.cand-table th, .cand-table td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+.cand-table th { background: #f8fafc; color: var(--dim); font-weight: 600; }
+.cand-table tr.auto-chosen td { background: var(--added-bg); }
+.sim-bar {
+  display: inline-block;
+  width: 72px;
+  height: 8px;
+  border-radius: 4px;
+  background: #e2e8f0;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+.sim-fill { display: block; height: 100%; background: var(--primary); }
+.remount-log {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  font-size: 13px;
+  color: var(--dim);
+}
+.remounted { color: #0e7490; font-size: 12px; }
+
+.remount-panel {
+  border: 1px solid #a5b4fc;
+  background: #eef2ff;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 8px 0;
+}
+.remount-title { font-size: 13px; font-weight: 600; color: #3730a3; margin-bottom: 8px; }
+.remount-cands { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.remount-cand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+.remount-cand:hover { border-color: var(--primary); }
+.remount-text { color: var(--text); flex: 1 1 100%; }
+.remount-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.remount-actions .remount-operator { width: 180px; }
+
 /* 决议稿 */
 .resolution-bar {
   display: flex;
