@@ -458,6 +458,83 @@ textarea { width: 100%; resize: vertical; font-family: inherit; }
 .todo-item { margin: 8px 0; font-size: 14px; }
 .todo-reason { color: #c2410c; margin: 2px 0; }
 
+/* 迁移复核 */
+.migration-panel {
+  border: 1px solid #c7d2fe;
+  background: #eef2ff;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+}
+.mig-panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.mig-items { margin-top: 10px; }
+.mig-item {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+}
+.mig-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.mig-body { margin: 6px 0; font-size: 14px; }
+.mig-anchor { margin-bottom: 6px; }
+
+.cand-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-top: 4px;
+}
+.cand-table th, .cand-table td {
+  border-top: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.cand-table th { color: var(--dim); font-weight: 600; border-top: none; }
+.cand-table tr.chosen td { background: var(--resolved-bg); }
+.cand-text-row td { border-top: none; padding-top: 0; }
+.cand-text {
+  color: var(--dim);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.sim-bar {
+  display: inline-block;
+  width: 72px;
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 4px;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+.sim-fill { display: block; height: 100%; background: var(--primary); }
+
+.remounted {
+  color: #7c3aed;
+  font-size: 12px;
+  background: #f5f3ff;
+  border-radius: 4px;
+  padding: 0 6px;
+}
+
+.remount-box {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: #f5f3ff;
+  border: 1px dashed #c4b5fd;
+  border-radius: 6px;
+}
+.remount-box select { flex: 1 1 260px; font-size: 13px; }
+.remount-box input { width: 130px; font-size: 13px; }
+
 /* 提示条 */
 .toast {
   position: fixed;

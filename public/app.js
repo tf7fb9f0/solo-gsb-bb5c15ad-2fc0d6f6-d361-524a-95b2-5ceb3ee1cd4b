@@ -150,10 +150,22 @@ async function renderProject(id) {
 
 /* ================= 视图：比对详情 ================= */
 
-const cmp = { id: null, data: null, status: 'all', author: 'all', onlyAnnotated: false, resolution: null };
+const cmp = {
+  id: null,
+  data: null,
+  status: 'all',
+  author: 'all',
+  onlyAnnotated: false,
+  resolution: null,
+  migration: null,
+  showMigration: false,
+};
 
 async function renderComparison(id) {
-  const data = await api('GET', `/api/comparisons/${id}`);
+  const [data, migration] = await Promise.all([
+    api('GET', `/api/comparisons/${id}`),
+    api('GET', `/api/comparisons/${id}/migration-report`),
+  ]);
   if (cmp.id !== id) {
     cmp.status = 'all';
     cmp.author = 'all';
@@ -161,6 +173,7 @@ async function renderComparison(id) {
   }
   cmp.id = id;
   cmp.data = data;
+  cmp.migration = migration;
   cmp.resolution = null; // 结论可能已变化，决议稿需重新生成
   drawComparison();
 }
@@ -185,12 +198,16 @@ function annHtml(a) {
   const migrated = a.migrated_from != null
     ? `<span class="migrated" title="从上一轮比对自动迁移">⤳ 迁移${a.similarity != null ? ` · 相似度 ${(a.similarity * 100).toFixed(0)}%` : ''}</span>`
     : '';
+  const remounted = a.remounted_at != null
+    ? `<span class="remounted" title="人工重新挂载到候选片段">↻ 重挂 · ${esc(a.remounted_by || '（未署名）')} · ${esc(a.remounted_at)}</span>`
+    : '';
   return `
     <div class="ann st-${a.status}">
       <div class="ann-head">
         <b>${esc(a.author)}</b>
         <span class="badge st-${a.status}">${STATUS_LABEL[a.status]}</span>
         ${migrated}
+        ${remounted}
         <span class="dim">${esc(a.updated_at)}</span>
       </div>
       <div class="ann-body">${esc(a.content)}</div>
@@ -201,7 +218,102 @@ function annHtml(a) {
             `<option value="${v}" ${v === a.status ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
         <button class="btn small danger" data-action="delete-annotation" data-id="${a.id}">删除</button>
-      </div>`}
+      </div>
+      ${remountHtml(a)}`}
+    </div>`;
+}
+
+/* ================= 迁移复核 ================= */
+
+/** 某条批注在迁移报告中保存的候选片段（按相似度降序） */
+function candidatesFor(annotationId) {
+  const m = cmp.migration;
+  if (!m) return [];
+  const item = m.items.find((it) => it.annotation.id === annotationId);
+  return item ? item.candidates : [];
+}
+
+/** 待复核批注的重新挂载控件：候选片段（含相似度）优先，其余片段列在后面 */
+function remountHtml(a) {
+  if (a.status !== 'pending_review') return '';
+  const cands = candidatesFor(a.id);
+  const candIds = new Set(cands.map((c) => c.fragment_id));
+  const others = cmp.data.fragments.filter((f) => !candIds.has(f.id));
+  const opts = ['<option value="">选择要挂载的片段…</option>'];
+  for (const c of cands) {
+    opts.push(
+      `<option value="${c.fragment_id}">候选：片段 #${c.fragment_ord}（${TYPE_LABEL[c.fragment_type]}）· 相似度 ${(c.similarity * 100).toFixed(0)}%</option>`
+    );
+  }
+  for (const f of others) {
+    opts.push(`<option value="${f.id}">片段 #${f.ord}（${TYPE_LABEL[f.type]}）</option>`);
+  }
+  return `
+    <div class="remount-box" data-ann="${a.id}">
+      <select class="remount-frag" title="迁移时保存的候选片段按相似度排序，列在最前">${opts.join('')}</select>
+      <input class="remount-by" maxlength="50" placeholder="操作者" value="${esc(lastAuthor.get())}">
+      <button class="btn small primary" data-action="remount" data-id="${a.id}">↻ 重新挂载</button>
+    </div>`;
+}
+
+function migrationItemHtml(it) {
+  const a = it.annotation;
+  const cur = it.current_fragment;
+  const rows = it.candidates.map((c) => `
+    <tr${c.chosen ? ' class="chosen"' : ''}>
+      <td>${c.rank}</td>
+      <td>片段 #${c.fragment_ord}（${TYPE_LABEL[c.fragment_type] ?? ''}）</td>
+      <td>${c.side === 'new' ? '新文本' : '旧文本'}</td>
+      <td>
+        <span class="sim-bar"><span class="sim-fill" style="width:${Math.round(c.similarity * 100)}%"></span></span>
+        ${(c.similarity * 100).toFixed(0)}%
+      </td>
+      <td>${c.chosen ? '✓ 当前挂载' : ''}</td>
+    </tr>
+    <tr class="cand-text-row${c.chosen ? ' chosen' : ''}">
+      <td></td><td colspan="4"><span class="cand-text">${esc(c.text_preview)}</span></td>
+    </tr>`).join('');
+  return `
+    <div class="mig-item">
+      <div class="mig-head">
+        <b>批注 #${a.id} · ${esc(a.author)}</b>
+        <span class="badge st-${a.status}">${STATUS_LABEL[a.status]}</span>
+        <span class="dim">挂载：${cur ? `片段 #${cur.ord}（${TYPE_LABEL[cur.type]}）` : '未挂载'}</span>
+        ${a.remounted_at != null
+          ? `<span class="remounted">↻ 人工重挂 · ${esc(a.remounted_by || '（未署名）')} · ${esc(a.remounted_at)}</span>`
+          : ''}
+      </div>
+      <div class="mig-body">${esc(a.content)}</div>
+      <div class="dim mig-anchor">锚点文本：${esc(a.anchor_text ?? '（空）')}</div>
+      ${it.candidates.length > 0
+        ? `<table class="cand-table">
+            <thead><tr><th>#</th><th>候选片段</th><th>比对侧</th><th>相似度</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`
+        : '<div class="dim">无相似度大于 0 的候选片段。</div>'}
+    </div>`;
+}
+
+/** 迁移复核报告面板：按比对查看每条迁移批注的候选片段与相似度 */
+function migrationPanelHtml() {
+  const m = cmp.migration;
+  if (!m || m.items.length === 0) return '';
+  const s = m.stats;
+  return `
+    <div class="migration-panel${cmp.showMigration ? ' open' : ''}">
+      <div class="mig-panel-head">
+        <button class="btn small" data-action="toggle-migration">
+          ${cmp.showMigration ? '▾ 收起' : '▸ 展开'}迁移复核报告
+        </button>
+        <span class="dim">
+          迁移 ${s.total} 条 · 已挂载 ${s.mounted} ·
+          <b class="${s.pending_review > 0 ? 'warn' : ''}">待复核 ${s.pending_review}</b> · 人工重挂 ${s.remounted}
+        </span>
+      </div>
+      ${cmp.showMigration
+        ? `<div class="mig-items">${m.items.map(migrationItemHtml).join('')}</div>
+           <p class="hint">候选片段按迁移时计算的相似度降序保存（最多 5 个）；「待复核」批注可在上方待复核区或下方片段中选择候选片段重新挂载，重挂会记录操作者与时间。</p>`
+        : ''}
     </div>`;
 }
 
@@ -434,7 +546,7 @@ function drawComparison() {
       ${comparison.sealed_at ? `
         <div class="sealed-banner">
           🔒 本比对已于 <b>${esc(comparison.sealed_at)}</b> 由 <b>${esc(comparison.sealed_by || '（未署名）')}</b> 封存。
-          封存后禁止修改片段结论，禁止新增、编辑、改状态或删除批注。
+          封存后禁止修改片段结论，禁止新增、编辑、改状态或删除批注，禁止重新挂载批注。
         </div>` : sealPanelHtml(cmp.data)}
 
       <div class="stats">
@@ -449,6 +561,8 @@ function drawComparison() {
         <span class="chip st-pending_review${stats.annotations.pending_review > 0 ? ' hot' : ''}">待复核批注 ${stats.annotations.pending_review}</span>
         <span class="chip st-resolved">已解决 ${stats.annotations.resolved}</span>
       </div>
+
+      ${migrationPanelHtml()}
 
       ${resolutionBarHtml(cmp.data)}
 
@@ -608,6 +722,37 @@ document.addEventListener('click', async (e) => {
     } else if (action === 'close-resolution') {
       cmp.resolution = null;
       drawComparison();
+    } else if (action === 'toggle-migration') {
+      cmp.showMigration = !cmp.showMigration;
+      drawComparison();
+    } else if (action === 'remount') {
+      const box = btn.closest('.remount-box');
+      const sel = box.querySelector('.remount-frag');
+      const byInput = box.querySelector('.remount-by');
+      const fragmentId = Number(sel.value);
+      const operator = byInput.value.trim();
+      if (!fragmentId) {
+        toast('请先选择要挂载的候选片段', true);
+        sel.focus();
+        return;
+      }
+      if (!operator) {
+        toast('请填写操作者姓名', true);
+        byInput.focus();
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api('POST', `/api/annotations/${btn.dataset.id}/remount`, {
+          fragment_id: fragmentId,
+          operator,
+        });
+        lastAuthor.set(operator);
+        toast('批注已重新挂载，状态恢复为「待处理」');
+        await renderComparison(cmp.id);
+      } finally {
+        btn.disabled = false;
+      }
     } else if (action === 'seal') {
       const input = document.getElementById('seal-by');
       const sealedBy = input.value.trim();

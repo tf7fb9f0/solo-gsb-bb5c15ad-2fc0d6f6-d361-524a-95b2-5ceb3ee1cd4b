@@ -1,5 +1,5 @@
 import type { DB } from './db';
-import { splitParagraphs, buildFragments } from './diff';
+import { splitParagraphs, buildFragments, similarity } from './diff';
 import { migrateAnnotations, type MigrationResult } from './migrate';
 
 export function createProject(db: DB, name: string): number {
@@ -404,6 +404,194 @@ export function deleteAnnotation(
   return { status: 'ok' };
 }
 
+/* ================= 迁移复核 ================= */
+
+export interface MigrationCandidateRow {
+  fragment_id: number | null;
+  fragment_ord: number | null;
+  fragment_type: string | null;
+  side: 'old' | 'new';
+  similarity: number;
+  rank: number;
+  chosen: boolean;
+  /** 候选文本预览（截取前 160 字） */
+  text_preview: string;
+}
+
+export interface MigrationReportItem {
+  annotation: AnnotationRow;
+  /** 当前挂载的片段（未挂载为 null） */
+  current_fragment: { id: number; ord: number; type: string } | null;
+  /** 迁移时保存的候选片段，按相似度降序 */
+  candidates: MigrationCandidateRow[];
+}
+
+export interface MigrationReport {
+  comparison_id: number;
+  sealed: boolean;
+  stats: {
+    /** 本轮迁移产生的批注总数 */
+    total: number;
+    /** 当前已挂载到片段的数量 */
+    mounted: number;
+    /** 仍处于「待复核」的数量 */
+    pending_review: number;
+    /** 经人工重新挂载的数量 */
+    remounted: number;
+  };
+  items: MigrationReportItem[];
+}
+
+/**
+ * 按比对查看迁移报告：本轮比对中所有迁移产生的批注（migrated_from 非空），
+ * 连同各自保存的候选片段与相似度，供复核与人工重挂。
+ */
+export function getMigrationReport(db: DB, comparisonId: number): MigrationReport | null {
+  const cmpRow = db
+    .prepare('SELECT sealed_at FROM comparisons WHERE id = ?')
+    .get(comparisonId) as { sealed_at: string | null } | undefined;
+  if (!cmpRow) return null;
+
+  const annotations = db
+    .prepare(
+      `SELECT * FROM annotations
+        WHERE comparison_id = ? AND migrated_from IS NOT NULL
+        ORDER BY id`
+    )
+    .all(comparisonId) as AnnotationRow[];
+
+  const fragStmt = db.prepare('SELECT id, ord, type FROM fragments WHERE id = ?');
+  const candStmt = db.prepare(
+    `SELECT fragment_id, fragment_ord, fragment_type, side, candidate_text, similarity, rank, chosen
+       FROM migration_candidates
+      WHERE annotation_id = ?
+      ORDER BY rank`
+  );
+
+  const items: MigrationReportItem[] = annotations.map((a) => {
+    const current =
+      a.fragment_id == null
+        ? null
+        : (fragStmt.get(a.fragment_id) as { id: number; ord: number; type: string } | undefined) ??
+          null;
+    const candidates = (candStmt.all(a.id) as Array<{
+      fragment_id: number | null;
+      fragment_ord: number | null;
+      fragment_type: string | null;
+      side: 'old' | 'new';
+      candidate_text: string | null;
+      similarity: number;
+      rank: number;
+      chosen: number;
+    }>).map((c) => ({
+      fragment_id: c.fragment_id,
+      fragment_ord: c.fragment_ord,
+      fragment_type: c.fragment_type,
+      side: c.side,
+      similarity: c.similarity,
+      rank: c.rank,
+      chosen: c.chosen === 1,
+      text_preview: (c.candidate_text ?? '').slice(0, 160),
+    }));
+    return { annotation: a, current_fragment: current, candidates };
+  });
+
+  const stats: MigrationReport['stats'] = {
+    total: items.length,
+    mounted: 0,
+    pending_review: 0,
+    remounted: 0,
+  };
+  for (const it of items) {
+    if (it.annotation.fragment_id != null) stats.mounted++;
+    if (it.annotation.status === 'pending_review') stats.pending_review++;
+    if (it.annotation.remounted_at != null) stats.remounted++;
+  }
+
+  return {
+    comparison_id: comparisonId,
+    sealed: cmpRow.sealed_at != null,
+    stats,
+    items,
+  };
+}
+
+export type RemountResult =
+  | { status: 'ok'; annotation: AnnotationRow }
+  | { status: 'not_found' }
+  | { status: 'sealed' }
+  | { status: 'not_pending' }
+  | { status: 'fragment_not_found' };
+
+/**
+ * 把「待复核」批注重新挂载到人工选择的候选片段：
+ *  - 仅允许 pending_review 状态的批注；目标片段必须属于同一比对；
+ *  - 在单个事务内完成：更新批注挂载点（状态恢复为「待处理」）、
+ *    记录操作者与时间、同步候选片段的 chosen 标记；
+ *  - 已封存的比对禁止重挂。
+ */
+export function remountAnnotation(
+  db: DB,
+  annotationId: number,
+  fragmentId: number,
+  operator: string
+): RemountResult {
+  const tx = db.transaction((): RemountResult => {
+    const ann = db
+      .prepare(
+        `SELECT a.id, a.comparison_id, a.status, a.anchor_text, c.sealed_at
+           FROM annotations a JOIN comparisons c ON c.id = a.comparison_id
+          WHERE a.id = ?`
+      )
+      .get(annotationId) as
+      | {
+          id: number;
+          comparison_id: number;
+          status: string;
+          anchor_text: string | null;
+          sealed_at: string | null;
+        }
+      | undefined;
+    if (!ann) return { status: 'not_found' };
+    if (ann.sealed_at != null) return { status: 'sealed' };
+    if (ann.status !== 'pending_review') return { status: 'not_pending' };
+
+    const frag = db
+      .prepare('SELECT id, old_text, new_text FROM fragments WHERE id = ? AND comparison_id = ?')
+      .get(fragmentId, ann.comparison_id) as
+      | { id: number; old_text: string | null; new_text: string | null }
+      | undefined;
+    if (!frag) return { status: 'fragment_not_found' };
+
+    // 以锚点与目标片段两侧文本的较高相似度作为本次挂载的相似度
+    const anchor = ann.anchor_text ?? '';
+    const sim = Math.max(
+      frag.old_text ? similarity(anchor, frag.old_text) : 0,
+      frag.new_text ? similarity(anchor, frag.new_text) : 0
+    );
+
+    db.prepare(
+      `UPDATE annotations
+          SET fragment_id = ?, status = 'open', similarity = ?,
+              remounted_by = ?, remounted_at = datetime('now', 'localtime'),
+              updated_at = datetime('now', 'localtime')
+        WHERE id = ?`
+    ).run(fragmentId, sim, operator, annotationId);
+
+    // 同步候选标记：人工选中的候选置为 chosen，其余清除
+    db.prepare('UPDATE migration_candidates SET chosen = 0 WHERE annotation_id = ?').run(
+      annotationId
+    );
+    db.prepare(
+      'UPDATE migration_candidates SET chosen = 1 WHERE annotation_id = ? AND fragment_id = ?'
+    ).run(annotationId, fragmentId);
+
+    const row = db.prepare('SELECT * FROM annotations WHERE id = ?').get(annotationId) as AnnotationRow;
+    return { status: 'ok', annotation: row };
+  });
+  return tx();
+}
+
 export interface AnnotationRow {
   id: number;
   comparison_id: number;
@@ -414,6 +602,9 @@ export interface AnnotationRow {
   anchor_text: string | null;
   similarity: number | null;
   migrated_from: number | null;
+  /** 人工重新挂载的操作者与时间（未重挂过为 null） */
+  remounted_by: string | null;
+  remounted_at: string | null;
   created_at: string;
   updated_at: string;
 }

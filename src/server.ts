@@ -12,6 +12,8 @@ import {
   getSealBlockers,
   updateAnnotation,
   deleteAnnotation,
+  getMigrationReport,
+  remountAnnotation,
   FRAGMENT_DECISIONS,
   type FragmentDecision,
 } from './service';
@@ -262,6 +264,37 @@ app.delete('/api/annotations/:id', (req, res) => {
   if (result.status === 'not_found') return notFound(res, '批注不存在');
   if (result.status === 'sealed') return conflict(res, '该比对已封存，禁止删除批注');
   res.status(204).end();
+});
+
+// ---------- 迁移复核 ----------
+/** 按比对查看迁移报告：每条迁移批注的候选片段及相似度 */
+app.get('/api/comparisons/:id/migration-report', (req, res) => {
+  const report = getMigrationReport(db, Number(req.params.id));
+  if (!report) return notFound(res, '比对不存在');
+  res.json(report);
+});
+
+/** 待复核批注重新挂载到人工选择的候选片段（事务内完成，记录操作者与时间） */
+app.post('/api/annotations/:id/remount', (req, res) => {
+  const id = Number(req.params.id);
+  const fragmentId = Number(req.body?.fragment_id);
+  const operator = String(req.body?.operator ?? '').trim();
+  if (!Number.isInteger(fragmentId) || fragmentId <= 0) {
+    return badRequest(res, '目标片段不合法');
+  }
+  if (!operator) return badRequest(res, '操作者必填');
+  if (operator.length > 50) return badRequest(res, '操作者姓名过长（最多 50 字）');
+
+  const result = remountAnnotation(db, id, fragmentId, operator);
+  if (result.status === 'not_found') return notFound(res, '批注不存在');
+  if (result.status === 'sealed') return conflict(res, '该比对已封存，禁止重新挂载批注');
+  if (result.status === 'not_pending') {
+    return badRequest(res, '仅「待复核」状态的批注可重新挂载');
+  }
+  if (result.status === 'fragment_not_found') {
+    return badRequest(res, '目标片段不存在或不属于本比对');
+  }
+  res.json({ annotation: result.annotation });
 });
 
 // ---------- 导出 ----------

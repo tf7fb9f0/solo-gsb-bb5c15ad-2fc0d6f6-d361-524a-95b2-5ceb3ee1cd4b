@@ -65,10 +65,28 @@ export function createSchema(db: DB): void {
       updated_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
     );
     CREATE INDEX IF NOT EXISTS idx_annotations_comparison ON annotations(comparison_id, status);
+
+    -- 迁移复核：每条迁移批注的候选片段及相似度（按 rank 排序，rank=1 为最佳）
+    CREATE TABLE IF NOT EXISTS migration_candidates (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      annotation_id INTEGER NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+      comparison_id INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+      fragment_id   INTEGER REFERENCES fragments(id) ON DELETE CASCADE,
+      fragment_ord  INTEGER,
+      fragment_type TEXT,
+      side          TEXT NOT NULL CHECK (side IN ('old', 'new')),
+      candidate_text TEXT,
+      similarity    REAL NOT NULL,
+      rank          INTEGER NOT NULL,
+      chosen        INTEGER NOT NULL DEFAULT 0,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_migcand_annotation ON migration_candidates(annotation_id, rank);
+    CREATE INDEX IF NOT EXISTS idx_migcand_comparison ON migration_candidates(comparison_id);
   `);
 }
 
-/** 旧版本数据库平滑升级：补齐封存 / 片段结论相关列 */
+/** 旧版本数据库平滑升级：补齐封存 / 片段结论 / 迁移复核相关列 */
 function migrateSchema(db: DB): void {
   const addColumnIfMissing = (table: string, column: string, ddl: string) => {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
@@ -82,6 +100,9 @@ function migrateSchema(db: DB): void {
   addColumnIfMissing('fragments', 'decision_reason', 'decision_reason TEXT');
   addColumnIfMissing('fragments', 'decided_by', 'decided_by TEXT');
   addColumnIfMissing('fragments', 'decided_at', 'decided_at TEXT');
+  // 迁移复核：人工重新挂载的操作者与时间
+  addColumnIfMissing('annotations', 'remounted_by', 'remounted_by TEXT');
+  addColumnIfMissing('annotations', 'remounted_at', 'remounted_at TEXT');
 }
 
 export function openDb(dbPath: string): DB {
